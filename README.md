@@ -26,7 +26,7 @@
 **1. 下载项目，预览配置。** 选一个长期保留的位置，再执行：
 
 ```sh
-git clone https://github.com/s840207702/claude-code-on-mac.git
+git clone https://github.com/s840207702/claude-code-macos.git claude-code-on-mac
 cd claude-code-on-mac
 ./scripts/doctor.zsh
 npm ci --ignore-scripts
