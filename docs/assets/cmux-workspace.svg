@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 185" width="880" height="185" role="img" aria-labelledby="title desc">
+  <title id="title">在 cmux 中打开项目和新建对话</title>
+  <desc id="desc">左侧选中项目 notes-app，右侧窗格有编写功能和审查改动两个独立的 Claude 会话。Command O 打开项目，Command T 新增对话。</desc>
+  <rect width="880" height="185" rx="14" fill="#20252b"/>
+  <rect x="1" y="1" width="878" height="183" rx="13" fill="none" stroke="#51575e"/>
+  <path d="M228 1v183" stroke="#474e56"/>
+  <g font-family="system-ui, -apple-system, 'PingFang SC', sans-serif">
+    <g fill="#b1bac5" font-size="15">
+      <text x="24" y="35">工作区</text>
+      <text x="251" y="35">当前窗格</text>
+    </g>
+    <rect x="14" y="50" width="200" height="45" rx="8" fill="#414954"/>
+    <path d="M29 65h9l3 4h12v11H29z" fill="none" stroke="#f5bf9f" stroke-width="2"/>
+    <text x="64" y="79" font-size="20" fill="#faf7f4">notes-app</text>
+    <g font-size="18">
+      <rect x="250" y="50" width="155" height="45" rx="8" fill="#593e33"/>
+      <text x="275" y="79" fill="#ffd4bb">编写功能</text>
+      <rect x="413" y="50" width="155" height="45" rx="8" fill="#2c3239" stroke="#555c65"/>
+      <text x="438" y="79" fill="#dae0e5">审查改动</text>
+    </g>
+    <path d="M251 111h604" stroke="#414850"/>
+    <g fill="#c8d0d7" font-size="17">
+      <text x="25" y="149">⌘O　打开项目</text>
+      <text x="251" y="149">⌘T　在这个项目里另开一条对话</text>
+    </g>
+  </g>
+</svg>
