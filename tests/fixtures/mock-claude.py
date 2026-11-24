@@ -10,7 +10,7 @@ import time
 from uuid import uuid4
 
 
-profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
+profile = Path(os.environ["CLAUDE_CONFIG_DIR"]).resolve()
 account = profile.name
 root = Path.home()
 scenario = os.environ.get("SCENARIO", "five-hour")
@@ -39,6 +39,13 @@ if args[-1:] == ["/usage"]:
         used = 99
     if scenario == "above":
         used = 94
+    if scenario == "idle-recheck" and account == "alpha" and (root / "running").exists():
+        observed = root / "already-checked"
+        used = 95 if observed.exists() else 90
+        observed.touch()
+    if scenario == "during-check" and account == "alpha" and (root / "running").exists():
+        (root / "checking").touch()
+        time.sleep(0.6)
     five, week = (10, used) if scenario == "weekly" else (used, 10)
     reply({"result": f"Current session: {five}% used\nCurrent week (all models): {week}% used"})
 
@@ -71,10 +78,10 @@ hook("UserPromptSubmit")
 if scenario == "failure":
     hook("StopFailure", error="account_on_hold")
 hook("Stop", background_tasks=["running"] if scenario == "busy" else [], session_crons=[])
-if scenario in {"busy", "failure", "above", "draft"}:
+if scenario in {"busy", "failure", "above", "draft", "during-check"}:
     time.sleep(1.6)
     if scenario == "failure":
         assert hook("UserPromptSubmit") == 2
         (root / "blocked").touch()
     sys.exit()
-time.sleep(12)
+time.sleep(80 if scenario == "idle-recheck" else 12)

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the native Claude Code terminal and switch official logins between turns."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 import argparse
 import errno
 import fcntl
@@ -33,11 +35,60 @@ PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*", re.ASCII)
 APPROVED_MODES = {"default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 SETTLE_SECONDS = 0.5
-TERMINAL_REPLIES = re.compile(
-    rb"(?:(?:\x1b\[(?:[0-9;]*[Rn]|[?>][0-9;:]*[cnu]|[0-9;]+[ct]|"
-    rb"\?[0-9;]+\$y|[IO]))|(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))|"
-    rb"(?:\x1bP[^\x1b]*\x1b\\))+"
+IDLE_RECHECK_SECONDS = 60
+CSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+CSI_PREFIX = re.compile(rb"\x1b\[[0-?]*[ -/]*")
+# Recognize reports only. Arrow keys, paste delimiters and ordinary key presses
+# can change the prompt. Numeric fields in mouse reports are button, x and y.
+CSI_REPORT = re.compile(
+    rb"(?:[IO]|[0-9]+;[0-9]+R|[0-9]+n|[?>][0-9;:]*[cnu]|[0-9;]+[ct]|"
+    rb"\?[0-9;]+\$y|[0-9:]+;[0-9]+:3(?:;[0-9:]*)?u|"
+    rb"<(?:35|64|65);[0-9]+;[0-9]+[Mm])"
 )
+
+
+class TerminalInput:
+    """Classify input across PTY reads without changing the bytes forwarded."""
+
+    def __init__(self):
+        self.partial = b""
+        self.last_edit = 0
+
+    def feed(self, data):
+        data = self.partial + data
+        self.partial = b""
+        while data:
+            if data.startswith(b"\x1b["):
+                match = CSI.match(data)
+                if match:
+                    if not CSI_REPORT.fullmatch(match[0][2:]):
+                        self.last_edit = time.time()
+                    data = data[match.end():]
+                    continue
+                if len(data) <= 128 and CSI_PREFIX.fullmatch(data):
+                    self.partial = data
+                    return
+            elif data.startswith((b"\x1b]", b"\x1bP")):
+                # OSC color reports and DCS capability replies may span reads.
+                end = re.search(rb"\x1b\\|\x07", data[2:])
+                if not end and len(data) <= 1024:
+                    self.partial = data
+                    return
+                if end:
+                    payload = data[2:2 + end.start()]
+                    if not re.fullmatch(rb"(?:[0-9;]+;rgb:[0-9a-fA-F/]+|[01]\+r[0-9a-fA-F;=]+|>\|[ -~]+)", payload):
+                        self.last_edit = time.time()
+                    data = data[2 + end.end():]
+                    continue
+            elif data == b"\x1b":
+                self.partial = data
+                return
+            self.last_edit = time.time()
+            # Skip plain bytes in a batch, then inspect any trailing escape.
+            following = data.find(b"\x1b", 1)
+            if following < 0:
+                return
+            data = data[following:]
 
 
 DIRECT = {
@@ -364,16 +415,21 @@ def oversee(roster, active, state, state_file, reserve, events, pid, master):
     attributes = termios.tcgetattr(terminal)
     try:
         tty.setraw(terminal)
-        return forward_terminal(roster, active, state, state_file, reserve, events, pid, master)
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            return forward_terminal(roster, active, state, state_file, reserve, events, pid, master, worker)
     finally:
         termios.tcsetattr(terminal, termios.TCSANOW, attributes)
 
 
-def forward_terminal(roster, active, state, state_file, reserve, events, pid, master):
+def forward_terminal(roster, active, state, state_file, reserve, events, pid, master, worker):
     terminal = sys.stdin.fileno()
     current_size = copy_terminal_size(master)
-    handled_stop = 0
-    last_key = 0
+    inputs = TerminalInput()
+    recorded_stop = 0
+    checked_stop = 0
+    next_check = 0
+    lookup = None
+    lookup_stop = 0
     failed = False
     recorded_start = None
     registry = account_home(active) / "sessions" / f"{pid}.json"
@@ -399,9 +455,7 @@ def forward_terminal(roster, active, state, state_file, reserve, events, pid, ma
             if not data:
                 return None
             os.write(master, data)
-            # Ignore terminal capability/focus replies and count any real user input.
-            if not TERMINAL_REPLIES.fullmatch(data):
-                last_key = time.time()
+            inputs.feed(data)
         size = fcntl.ioctl(terminal, termios.TIOCGWINSZ, bytes(8))
         if size != current_size:
             current_size = copy_terminal_size(master)
@@ -415,33 +469,47 @@ def forward_terminal(roster, active, state, state_file, reserve, events, pid, ma
             record_session(events, failure, active, state, state_file)
         stop = read_json(events / "stop.json")
         stop_at = stop.get("time", 0)
-        if not stop_at or failed or stop_at <= handled_stop or stop_at + SETTLE_SECONDS > time.time():
+        # Keep forwarding the terminal while the official CLI reads quota.
+        # Even a completed lookup is usable only at the same safe turn boundary.
+        target = None
+        if lookup is not None and lookup.done():
+            try:
+                target = lookup.result()
+            except (RelayStopped, subprocess.TimeoutExpired) as error:
+                write_json(events / "failed.json", {"error": str(error)})
+                relay_message(f"Claude 接力已暂停 · {error}")
+                failed = True
+            lookup = None
+            next_check = time.monotonic() + IDLE_RECHECK_SECONDS
+        if not stop_at or failed or stop_at + SETTLE_SECONDS > time.time():
             continue
-        next_input = read_json(events / "submit.json")
-        if next_input.get("time", 0) > stop_at:
-            handled_stop = stop_at
+        if lookup is not None:
+            continue
+        if target is None and checked_stop == stop_at and time.monotonic() < next_check:
+            continue
+        submitted = read_json(events / "submit.json").get("time", 0)
+        if submitted > stop_at or not stop.get("quiet"):
             continue
         live = read_json(registry)
         if live.get("status") != "idle" or live.get("sessionId") != stop.get("session_id"):
             continue
-        handled_stop = stop_at
-        if not record_session(events, stop, active, state, state_file):
+        if recorded_stop != stop_at:
+            if not record_session(events, stop, active, state, state_file):
+                continue
+            recorded_stop = stop_at
+        if inputs.partial or inputs.last_edit > submitted:
             continue
-        if not stop.get("quiet") or last_key > next_input.get("time", 0):
-            continue
-        try:
-            target = eligible(roster, active, reserve)
-        except (RelayStopped, subprocess.TimeoutExpired) as error:
-            write_json(events / "failed.json", {"error": str(error)})
-            relay_message(f"Claude 接力已暂停 · {error}")
-            continue
-        if target != active:
-            live = read_json(registry)
-            pending = select.select([terminal], [], [], 0)[0]
-            if (not pending and not (events / "failed.json").exists()
-                    and live.get("status") == "idle" and live.get("sessionId") == stop.get("session_id")
-                    and read_json(events / "submit.json").get("time", 0) <= stop_at):
+        if target is not None and lookup_stop == stop_at and target != active:
+            if select.select([terminal], [], [], 0)[0]:
+                # Classify the waiting bytes before retrying the handoff.
+                next_check = 0
+                continue
+            if (not (events / "failed.json").exists()
+                    and read_json(events / "submit.json").get("time", 0) == submitted):
                 return target
+        if checked_stop != stop_at or time.monotonic() >= next_check:
+            checked_stop = lookup_stop = stop_at
+            lookup = worker.submit(eligible, roster, active, reserve)
 
 
 def main():

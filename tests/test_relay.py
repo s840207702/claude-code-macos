@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import pty
+import runpy
 import select
 import subprocess
 import time
@@ -10,6 +11,24 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 RELAY = str(ROOT / "scripts/claude-relay")
+
+
+class InputTests(unittest.TestCase):
+    def test_control_keys_and_paste_are_protected(self):
+        tracker = runpy.run_path(RELAY)["TerminalInput"]
+        for sequence in (b"abc", b"\x1b[A", b"\x1b[200~", b"\x1b[Ia", b"\x1b[97;1u", b"\x03"):
+            with self.subTest(sequence=sequence):
+                stream = tracker()
+                stream.feed(sequence)
+                self.assertGreater(stream.last_edit, 0)
+
+    def test_replies_split_at_any_byte(self):
+        tracker = runpy.run_path(RELAY)["TerminalInput"]
+        for sequence in (b"\x1b[13;1:3u", b"\x1b[<64;10;20M", b"\x1b[?1;2c", b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"):
+            stream = tracker()
+            for byte in sequence:
+                stream.feed(bytes([byte]))
+            self.assertEqual((stream.partial, stream.last_edit), (b"", 0))
 
 
 class RelayTests(unittest.TestCase):
@@ -38,11 +57,19 @@ class RelayTests(unittest.TestCase):
             os.close(slave)
             output = bytearray()
             sent_draft = False
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + (75 if scenario == "idle-recheck" else 15)
             try:
                 while time.monotonic() < deadline:
-                    if scenario == "draft" and not sent_draft and list(self.home.glob("claude-relay-*/stop.json")):
-                        os.write(master, b"unfinished prompt")
+                    ready = list(self.home.glob("claude-relay-*/stop.json"))
+                    if scenario == "during-check":
+                        ready = (self.home / "checking").exists()
+                    if scenario in {"draft", "during-check", "reports"} and not sent_draft and ready:
+                        if scenario == "reports":
+                            os.write(master, b"\x1b[13;1:")
+                            time.sleep(0.1)
+                            os.write(master, b"3u\x1b[O\x1b[<65;3;2M")
+                        else:
+                            os.write(master, b"unfinished prompt")
                         sent_draft = True
                     if select.select([master], [], [], 0.1)[0]:
                         chunk = os.read(master, 8192)
@@ -52,7 +79,7 @@ class RelayTests(unittest.TestCase):
                     elif process.poll() is not None:
                         break
                 self.assertEqual(process.wait(timeout=1) == 0, success, output.decode(errors="replace"))
-                if scenario == "draft":
+                if scenario in {"draft", "during-check", "reports"}:
                     self.assertTrue(sent_draft)
             finally:
                 if process.poll() is None:
@@ -74,6 +101,15 @@ class RelayTests(unittest.TestCase):
 
     def test_five_hour_boundary(self):
         self.assertIn("/profiles/alpha/projects/", self.terminal("five-hour").read_text())
+
+    def test_fragmented_terminal_replies_allow_rotation(self):
+        self.assertTrue(self.terminal("reports").exists())
+
+    def test_typing_during_quota_lookup_blocks_rotation(self):
+        self.assertFalse(self.terminal("during-check").exists())
+
+    def test_other_pane_consumes_quota_while_idle(self):
+        self.assertTrue(self.terminal("idle-recheck").exists())
 
     def test_weekly_boundary(self):
         self.assertTrue(self.terminal("weekly").exists())
