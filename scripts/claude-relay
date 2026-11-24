@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Run the native Claude Code terminal and switch official logins between turns."""
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+from uuid import UUID, uuid4
+
+
+SELF = Path(__file__).resolve()
+HOME = Path.home()
+ROOT = HOME / ".config/claude-code-on-mac"
+CONFIG = ROOT / "relay"
+PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*", re.ASCII)
+
+
+APPROVED_MODES = {"default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+SETTLE_SECONDS = 0.5
+TERMINAL_REPLIES = re.compile(
+    rb"(?:(?:\x1b\[(?:[0-9;]*[Rn]|[?>][0-9;:]*[cnu]|[0-9;]+[ct]|"
+    rb"\?[0-9;]+\$y|[IO]))|(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))|"
+    rb"(?:\x1bP[^\x1b]*\x1b\\))+"
+)
+
+
+DIRECT = {
+    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "CLAUDE_CODE_OAUTH_TOKEN": "",
+    "CLAUDE_CODE_USE_BEDROCK": "",
+    "CLAUDE_CODE_USE_VERTEX": "",
+    "CLAUDE_CODE_USE_FOUNDRY": "",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+    "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
+}
+SETTINGS = json.dumps({"env": DIRECT, "forceLoginMethod": "claudeai", "apiKeyHelper": ""})
+QUOTA_FIELDS = (
+    ("5 小时", re.compile(r"^Current session:\s*(\d+(?:\.\d+)?)%\s+used\b", re.M)),
+    ("周", re.compile(r"^Current week \(all models\):\s*(\d+(?:\.\d+)?)%\s+used\b", re.M)),
+)
+
+
+class RelayStopped(Exception):
+    pass
+
+
+def profile_name(name):
+    if not PROFILE_NAME.fullmatch(name):
+        raise argparse.ArgumentTypeError("配置名只能使用英文字母、数字、下划线和连字符")
+    return name
+
+
+def account_home(account):
+    return ROOT / "profiles" / profile_name(account)
+
+
+def claude_binary():
+    override = os.environ.get("CLAUDE_CLI_BIN")
+    native = HOME / ".local/bin/claude"
+    cli = override or (str(native) if os.access(native, os.X_OK) else shutil.which("claude"))
+    if not cli or not os.path.isabs(cli) or not os.access(cli, os.X_OK):
+        raise RelayStopped("找不到官方 Claude CLI。可用 CLAUDE_CLI_BIN 指定可执行文件的绝对路径。")
+    return cli
+
+
+def environment(account):
+    env = {name: value for name, value in os.environ.items() if not name.startswith("ANTHROPIC_")}
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    env.update(DIRECT)
+    env["CLAUDE_CONFIG_DIR"] = str(account_home(account))
+    return env
+
+
+def auth_id(account):
+    proc = subprocess.run(
+        [claude_binary(), "auth", "status", "--json"],
+        env=environment(account), capture_output=True, text=True, timeout=12,
+        start_new_session=True, stdin=subprocess.DEVNULL,
+    )
+    try:
+        auth = json.loads(proc.stdout)
+    except ValueError:
+        auth = {}
+    if not isinstance(auth, dict):
+        raise RelayStopped(f"{account} 号身份回执无效。")
+    email = auth.get("email")
+    if proc.returncode or not isinstance(email, str) or not email.strip() or (
+        auth.get("loggedIn"), auth.get("authMethod"), auth.get("apiProvider"), auth.get("subscriptionType")
+    ) != (True, "claude.ai", "firstParty", "pro"):
+        raise RelayStopped(f"{account} 号的官方 Pro 登录无效。续跑前请先检查登录。")
+    return hashlib.sha256(email.strip().casefold().encode()).hexdigest()
+
+
+def verify_account(account, roster):
+    if auth_id(account) != roster.get(account):
+        raise RelayStopped(f"{account} 号登录的账号与已配置的账号不同。")
+
+
+def quota(account, roster):
+    verify_account(account, roster)
+    proc = subprocess.run(
+        [
+            claude_binary(), "--print", "--output-format", "json",
+            "--no-session-persistence", "--restricted", "--setting-sources", "",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--tools", "", "--settings", SETTINGS, "--", "/usage",
+        ],
+        env=environment(account), input="", capture_output=True, text=True, timeout=25,
+        start_new_session=True,
+    )
+    try:
+        result = json.loads(proc.stdout)
+    except ValueError:
+        result = {}
+    if not isinstance(result, dict):
+        raise RelayStopped(f"{account} 号额度回执无效。")
+    raw = result.get("result", "")
+    if proc.returncode or result.get("is_error") or not isinstance(raw, str):
+        raise RelayStopped(f"{account} 号额度查询失败。请先核实账号和网络状态。")
+    remaining = {}
+    for label, pattern in QUOTA_FIELDS:
+        match = pattern.search(raw)
+        if not match or float(match[1]) > 100:
+            raise RelayStopped(f"无法确认 {account} 号的{label}额度。")
+        remaining[label] = 100 - float(match[1])
+    if re.search(r"currently using (?:your )?(?:extra usage|usage credits|overages)", raw, re.I):
+        raise RelayStopped(f"{account} 号显示正在使用额度外计费。")
+    return remaining
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, data):
+    fd, name = tempfile.mkstemp(dir=str(path.parent))
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "w") as file:
+            json.dump(data, file, ensure_ascii=False)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def hook(events, action):
+    payload = json.load(sys.stdin)
+    mark = {
+        "session_id": payload.get("session_id"),
+        "transcript": payload.get("transcript_path"),
+        "permission": payload.get("permission_mode"),
+        "time": time.time(),
+    }
+    if action == "session":
+        write_json(events / "session.json", mark)
+    elif action == "submit":
+        if (events / "failed.json").exists():
+            print("Claude 接力已暂停。请用 /exit 退出，核实后再恢复。", file=sys.stderr)
+            return 2
+        write_json(events / "submit.json", mark)
+    elif action == "stop":
+        mark["quiet"] = payload.get("background_tasks") == [] and payload.get("session_crons") == []
+        write_json(events / "stop.json", mark)
+    elif action == "failure":
+        mark["error"] = payload.get("error") or "unknown"
+        write_json(events / "failed.json", mark)
+    return 0
+
+
+def statusline(events):
+    raw = sys.stdin.buffer.read()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {}
+    write_json(events / "view.json", {
+        "session_id": data.get("session_id"),
+        "model": (data.get("model") or {}).get("id"),
+        "effort": (data.get("effort") or {}).get("level"),
+    })
+    original = os.environ.get("CLAUDE_RELAY_STATUSLINE")
+    if original:
+        return subprocess.run(["/bin/sh", "-c", original], input=raw, timeout=8).returncode
+    return 0
+
+
+def native_settings(active, events):
+    settings = json.loads(SETTINGS)
+    # Hook only this launch. The original Claude settings remain authoritative outside it.
+    command = shlex.quote(sys.executable) + " " + shlex.quote(str(SELF))
+    event_path = shlex.quote(str(events))
+    settings["hooks"] = {}
+    for name, action in (
+        ("SessionStart", "session"), ("UserPromptSubmit", "submit"),
+        ("Stop", "stop"), ("StopFailure", "failure"),
+    ):
+        settings["hooks"][name] = [{
+            "hooks": [{"type": "command", "command": f"{command} _hook {event_path} {action}", "timeout": 5}],
+        }]
+    original = read_json(account_home(active) / "settings.json").get("statusLine")
+    if original is None:
+        original = read_json(HOME / ".claude/settings.json").get("statusLine", {})
+    if isinstance(original, dict) and original.get("type") == "command" and original.get("command"):
+        settings["statusLine"] = {
+            **original, "command": f"{command} _statusline {event_path}",
+        }
+        return settings, original["command"]
+    return settings, None
+
+
+def known_transcript(path, session_id, account):
+    try:
+        path = Path(path).expanduser().resolve()
+        root = (account_home(account) / "projects").resolve()
+        return str(path) if path.is_relative_to(root) and path.name == f"{UUID(session_id)}.jsonl" and path.is_file() else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def wait_for_exit(pid):
+    try:
+        ended, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True, 0
+    return bool(ended), status
+
+
+def stop_child(pid):
+    if wait_for_exit(pid)[0]:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(30):
+        if wait_for_exit(pid)[0]:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    for _ in range(20):
+        if wait_for_exit(pid)[0]:
+            return
+        time.sleep(0.05)
+    raise OSError("旧 Claude 进程还在退出，已暂停换号。")
+
+
+def relay_message(message):
+    os.write(sys.stdout.fileno(), ("\r\n" + message + "\r\n").encode())
+
+
+def copy_terminal_size(fd):
+    size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, bytes(8))
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, size)
+    return size
+
+
+def record_session(events, event, current, state, state_file):
+    transcript = known_transcript(event.get("transcript"), event.get("session_id"), current)
+    if not transcript:
+        return False
+    view = read_json(events / "view.json")
+    state.update({"account": current, "transcript": transcript})
+    if view.get("session_id") == event.get("session_id"):
+        if view.get("model"):
+            state["model"] = view["model"]
+        if view.get("effort") in EFFORT_LEVELS:
+            state["effort"] = view["effort"]
+    if event.get("permission") in APPROVED_MODES:
+        state["permission"] = event["permission"]
+    write_json(state_file, state)
+    return True
+
+
+def eligible(roster, current, reserve):
+    accounts = list(roster)
+    start = accounts.index(current)
+    for account in accounts[start:] + accounts[:start]:
+        if min(quota(account, roster).values()) > reserve:
+            return account
+    raise RelayStopped(f"全部已登记账号均有额度窗口剩余不超过 {reserve}%。")
+
+
+def register_cmux_resume(cwd, session_id, reserve):
+    if not (os.environ.get("CMUX_WORKSPACE_ID") and os.environ.get("CMUX_SURFACE_ID")):
+        return
+    command = [
+        os.environ.get("CMUX_BUNDLED_CLI_PATH") or shutil.which("cmux") or "/Applications/cmux.app/Contents/Resources/bin/cmux", "surface", "resume", "set",
+        "--kind", "claude-relay", "--name", "Claude 接力", "--cwd", cwd,
+        "--checkpoint", str(session_id), "--", str(SELF),
+        "--resume", str(session_id),
+    ]
+    if reserve != 5:
+        command += ["--reserve", str(reserve)]
+    try:
+        subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        print("cmux 未登记恢复命令，仍可用下方命令手动恢复。", flush=True)
+
+
+def native_session(roster, active, state, state_file, reserve):
+    with tempfile.TemporaryDirectory(prefix="claude-relay-") as temporary:
+        events = Path(temporary)
+        settings, original = native_settings(active, events)
+        profile_env = environment(active)
+        if original:
+            profile_env["CLAUDE_RELAY_STATUSLINE"] = original
+        args = [claude_binary(), "--settings", json.dumps(settings)]
+        if state.get("model"):
+            args += ["--model", state["model"]]
+        if state.get("effort") in EFFORT_LEVELS:
+            args += ["--effort", state["effort"]]
+        if state.get("permission") in APPROVED_MODES:
+            args += ["--permission-mode", state["permission"]]
+        if state.get("transcript"):
+            args += ["--resume", state["transcript"]]
+            if state["account"] != active:
+                args.append("--fork-session")
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(args[0], args, profile_env)
+            except OSError as error:
+                os.write(2, str(error).encode())
+                os._exit(127)
+        try:
+            return oversee(roster, active, state, state_file, reserve, events, pid, master)
+        finally:
+            # Releasing the old PTY lets a child waiting for terminal output finish exiting.
+            os.close(master)
+            try:
+                stop_child(pid)
+            finally:
+                os.write(sys.stdout.fileno(), b"\x1b[<u\x1b[>4;0m\x1b[?1049l\x1b[?2004l\x1b[?1004l\x1b[?25h\x1b[0m")
+
+
+def oversee(roster, active, state, state_file, reserve, events, pid, master):
+    terminal = sys.stdin.fileno()
+    attributes = termios.tcgetattr(terminal)
+    try:
+        tty.setraw(terminal)
+        return forward_terminal(roster, active, state, state_file, reserve, events, pid, master)
+    finally:
+        termios.tcsetattr(terminal, termios.TCSANOW, attributes)
+
+
+def forward_terminal(roster, active, state, state_file, reserve, events, pid, master):
+    terminal = sys.stdin.fileno()
+    current_size = copy_terminal_size(master)
+    handled_stop = 0
+    last_key = 0
+    failed = False
+    recorded_start = None
+    registry = account_home(active) / "sessions" / f"{pid}.json"
+    while True:
+        ready, _, _ = select.select([master, terminal], [], [], 0.12)
+        if master in ready:
+            try:
+                output = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                output = b""
+            if not output:
+                start = read_json(events / "session.json")
+                record_session(events, start, active, state, state_file)
+                ended, status = wait_for_exit(pid)
+                if ended and os.waitstatus_to_exitcode(status) != 0:
+                    raise RelayStopped("Claude 进程异常退出，已停止接力。")
+                return None
+            os.write(sys.stdout.fileno(), output)
+        if terminal in ready:
+            data = os.read(terminal, 65536)
+            if not data:
+                return None
+            os.write(master, data)
+            # Ignore terminal capability/focus replies and count any real user input.
+            if not TERMINAL_REPLIES.fullmatch(data):
+                last_key = time.time()
+        size = fcntl.ioctl(terminal, termios.TIOCGWINSZ, bytes(8))
+        if size != current_size:
+            current_size = copy_terminal_size(master)
+        start = read_json(events / "session.json")
+        if start.get("session_id") != recorded_start and record_session(events, start, active, state, state_file):
+            recorded_start = start["session_id"]
+        failure = read_json(events / "failed.json")
+        if failure and not failed:
+            failed = True
+            relay_message("Claude 本轮失败，接力暂停。请检查账号状态后再恢复。")
+            record_session(events, failure, active, state, state_file)
+        stop = read_json(events / "stop.json")
+        stop_at = stop.get("time", 0)
+        if not stop_at or failed or stop_at <= handled_stop or stop_at + SETTLE_SECONDS > time.time():
+            continue
+        next_input = read_json(events / "submit.json")
+        if next_input.get("time", 0) > stop_at:
+            handled_stop = stop_at
+            continue
+        live = read_json(registry)
+        if live.get("status") != "idle" or live.get("sessionId") != stop.get("session_id"):
+            continue
+        handled_stop = stop_at
+        if not record_session(events, stop, active, state, state_file):
+            continue
+        if not stop.get("quiet") or last_key > next_input.get("time", 0):
+            continue
+        try:
+            target = eligible(roster, active, reserve)
+        except (RelayStopped, subprocess.TimeoutExpired) as error:
+            write_json(events / "failed.json", {"error": str(error)})
+            relay_message(f"Claude 接力已暂停 · {error}")
+            continue
+        if target != active:
+            live = read_json(registry)
+            pending = select.select([terminal], [], [], 0)[0]
+            if (not pending and not (events / "failed.json").exists()
+                    and live.get("status") == "idle" and live.get("sessionId") == stop.get("session_id")
+                    and read_json(events / "submit.json").get("time", 0) <= stop_at):
+                return target
+
+
+def main():
+    parser = argparse.ArgumentParser(description="在同一个 cmux 窗格里按轮次接续 Claude Code")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--login", type=profile_name, metavar="NAME", help="在独立配置中进行官方登录")
+    action.add_argument("--enroll", type=profile_name, nargs="+", metavar="NAME", help="核对并登记接力顺序")
+    action.add_argument("--check", action="store_true", help="检查已登记账号的身份与两个额度窗口")
+    parser.add_argument("--resume", type=UUID)
+    parser.add_argument("--model")
+    parser.add_argument("--permission-mode", choices=sorted(APPROVED_MODES))
+    parser.add_argument("--reserve", type=int, default=5)
+    options = parser.parse_args()
+    os.umask(0o077)
+    if options.login:
+        account_home(options.login).mkdir(parents=True, exist_ok=True)
+        cli = claude_binary()
+        os.execve(cli, [cli, "auth", "login"], environment(options.login))
+    roster_file = CONFIG / "accounts.json"
+    if options.enroll:
+        if len(options.enroll) < 2 or len(set(options.enroll)) != len(options.enroll):
+            parser.error("请指定至少两个不同的配置名")
+        roster = {account: auth_id(account) for account in options.enroll}
+        if len(set(roster.values())) != len(roster):
+            raise RelayStopped("多个配置登录了同一账号，请核对浏览器当前账号后重新授权。")
+        CONFIG.mkdir(parents=True, exist_ok=True)
+        write_json(roster_file, roster)
+        print("接力顺序：" + " → ".join(roster))
+        return
+    if not 0 <= options.reserve <= 99:
+        parser.error("--reserve 必须介于 0 和 99")
+    roster = read_json(roster_file)
+    if (not isinstance(roster, dict) or len(roster) < 2
+            or not all(PROFILE_NAME.fullmatch(name) and isinstance(digest, str)
+                       and re.fullmatch(r"[a-f0-9]{64}", digest) for name, digest in roster.items())
+            or len(set(roster.values())) != len(roster)):
+        raise RelayStopped("请先使用 --login 分别登录，再用 --enroll 登记两个或更多不同账号。")
+    if options.check:
+        for account in roster:
+            remaining = quota(account, roster)
+            print(account + "  " + " · ".join(f"{label} 剩 {value:g}%" for label, value in remaining.items()))
+        return
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        parser.error("接力需要交互终端，请在项目的 cmux 窗格启动")
+    for account in roster:
+        verify_account(account, roster)
+    sessions = CONFIG / "sessions"
+    sessions.mkdir(exist_ok=True)
+    session_id = options.resume or uuid4()
+    state_file = sessions / f"{session_id}.json"
+    cwd = str(Path.cwd().resolve())
+    with (sessions / f"{session_id}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RelayStopped("已有窗格在运行这条接力会话。") from None
+        state = read_json(state_file) if options.resume else {"account": next(iter(roster)), "cwd": cwd}
+        if not state or state.get("cwd") != cwd:
+            raise RelayStopped("找不到该会话，或当前目录与会话所在项目不同。")
+        if state.get("account") not in roster:
+            raise RelayStopped("原会话的账号已从接力名单移除。")
+        if state.get("transcript"):
+            if not known_transcript(state["transcript"], Path(state["transcript"]).stem, state["account"]):
+                raise RelayStopped("找不到已保存的 Claude 会话记录。")
+        if options.model:
+            state["model"] = options.model
+        if options.permission_mode:
+            state["permission"] = options.permission_mode
+        active = eligible(roster, state["account"], options.reserve)
+        if not options.resume:
+            write_json(state_file, state)
+            register_cmux_resume(cwd, session_id, options.reserve)
+        print(f"Claude 接力 · {active} 号 · 恢复命令：{shlex.quote(str(SELF))} --resume {session_id} --reserve {options.reserve}", flush=True)
+        while active:
+            target = native_session(roster, active, state, state_file, options.reserve)
+            if target:
+                print(f"Claude 接力 · {active} → {target} · 正在恢复原生会话", flush=True)
+            active = target
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "_hook":
+        sys.exit(hook(Path(sys.argv[2]), sys.argv[3]))
+    if len(sys.argv) > 2 and sys.argv[1] == "_statusline":
+        sys.exit(statusline(Path(sys.argv[2])))
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n已退出 Claude 接力。")
+    except (RelayStopped, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        sys.exit(f"Claude 接力：{error}")

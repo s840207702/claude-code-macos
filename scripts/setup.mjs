@@ -11,6 +11,7 @@ const script = fileURLToPath(import.meta.url);
 const project = path.resolve(path.dirname(script), '..');
 const config = path.join(os.homedir(), '.config/cmux/cmux.json');
 const stateDir = path.join(os.homedir(), '.local/state/claude-code-on-mac');
+const relayMode = process.argv.slice(3).includes('--relay');
 const receipt = path.join(stateDir, 'install.json');
 const format = { formattingOptions: { insertSpaces: true, tabSize: 2 } };
 
@@ -47,8 +48,15 @@ function edit(text, keys, value) {
 function templateEntries() {
   const { actions, ui, shortcuts } = JSON.parse(fs.readFileSync(path.join(project, 'cmux/settings.json')));
   const picker = path.join(project, 'cmux/open-folder.zsh');
-  const quoted = "'" + picker.replaceAll("'", "'\\''") + "'";
-  actions['ccmac.openFolder'].workspace.layout.pane.surfaces[0].command = 'source ' + quoted;
+  const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+  const launcher = quote(path.join(project, 'scripts/claude-relay'));
+  let openFolder = 'source ' + quote(picker);
+  if (relayMode) {
+    openFolder += ' --relay ' + launcher;
+    actions['ccmac.newWorkspace'].workspace.layout.pane.surfaces[0].command = launcher;
+    actions['cmux.newTerminal'].command = launcher;
+  }
+  actions['ccmac.openFolder'].workspace.layout.pane.surfaces[0].command = openFolder;
   return [
     ...Object.entries(actions).map(([id, value]) => ({ keys: ['actions', id], value })),
     { keys: ['ui', 'newWorkspace', 'action'], value: ui.newWorkspace.action },
@@ -123,6 +131,8 @@ function run(mode) {
   }
   if (saved !== null) {
     const previous = JSON.parse(saved);
+    if (Boolean(previous.relayMode) !== relayMode)
+      throw new Error('切换启动模式前请先 npm run undo，再预览新的模式。');
     if (before === previous.before && mode === 'install') {
       commitConfig(before, previous.after);
       return console.log('安装已完成。');
@@ -134,19 +144,20 @@ function run(mode) {
   const changes = plan(before);
   for (const item of changes.additions) console.log('+ ' + item.keys.join('.') + ' ' + JSON.stringify(item.value));
   if (mode === 'preview' || !changes.additions.length) return;
-  atomicWrite(receipt, JSON.stringify(changes));
+  atomicWrite(receipt, JSON.stringify({ ...changes, relayMode }));
   commitConfig(before, changes.after);
   console.log('已安装。回到 cmux 按 ⌘⇧, 重载配置。');
 }
 
 try {
-  const [mode, locked] = process.argv.slice(2);
+  const [mode, ...flags] = process.argv.slice(2);
+  if (flags.some(flag => !['--relay', '--locked'].includes(flag))) throw new Error('参数无效。');
   if (!['preview', 'install', 'uninstall'].includes(mode)) throw new Error('用法：setup.mjs preview|install|uninstall');
-  if (mode === 'preview' || locked === '--locked') run(mode);
+  if (mode === 'preview' || flags.includes('--locked')) run(mode);
   else {
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     const child = spawnSync('/usr/bin/lockf', ['-t', '10', path.join(stateDir, 'setup.lock'),
-      process.execPath, script, mode, '--locked'], { stdio: 'inherit' });
+      process.execPath, script, mode, ...flags, '--locked'], { stdio: 'inherit' });
     if (child.error) throw child.error;
     process.exitCode = child.status ?? 1;
   }

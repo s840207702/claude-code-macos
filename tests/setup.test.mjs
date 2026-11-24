@@ -116,3 +116,26 @@ test('符号链接配置由原管理工具维护，拒绝写入且不留安装�
   assert.equal(fs.readlinkSync(f.config), target);
   assert.ok(!fs.existsSync(path.join(f.home, '.local/state/claude-code-on-mac/install.json')));
 });
+
+test('接力模式接管三个入口，单账号模式可独立恢复', t => {
+  const f = fixture(t);
+  const run = (mode, expected = 0) => {
+    const result = spawnSync(process.execPath, ['scripts/setup.mjs', mode, '--relay'], {
+      cwd: root, env: { ...process.env, HOME: f.home }, encoding: 'utf8',
+    });
+    assert.equal(result.status, expected, result.stderr);
+  };
+  run('preview');
+  assert.ok(!fs.existsSync(f.config));
+  run('install');
+  const settings = jsonc.parse(f.read());
+  const launcher = settings.actions['cmux.newTerminal'].command;
+  assert.match(launcher, /scripts\/claude-relay/);
+  const command = name => settings.actions[name].workspace.layout.pane.surfaces[0].command;
+  assert.equal(command('ccmac.newWorkspace'), launcher);
+  assert.ok(command('ccmac.openFolder').endsWith(' --relay ' + launcher));
+  f.run('install', 1);
+  f.run('uninstall');
+  f.run('install');
+  assert.equal(jsonc.parse(f.read()).actions['cmux.newTerminal'].command, 'claude');
+});

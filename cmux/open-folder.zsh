@@ -22,5 +22,9 @@ APPLESCRIPT
   builtin cd -- "$folder" || return 1
   local title=${PWD:t}
   "$cli" workspace rename "$CMUX_WORKSPACE_ID" --title "${title:-/}" >/dev/null
-  claude
-}
+  if [[ ${1:-} == --relay ]]; then
+    "$2"
+  else
+    claude
+  fi
+} "$@"
