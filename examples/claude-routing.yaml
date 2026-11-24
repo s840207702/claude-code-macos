@@ -1,0 +1,5 @@
+# 将下面两条插入有效配置的 rules 列表，放在 MATCH 和更宽泛的规则之前。
+# 将 CLAUDE-EXIT 替换为自己已有的策略组。此文件只提供规则片段。
+rules:
+  - DOMAIN-SUFFIX,anthropic.com,CLAUDE-EXIT
+  - DOMAIN-SUFFIX,claude.ai,CLAUDE-EXIT

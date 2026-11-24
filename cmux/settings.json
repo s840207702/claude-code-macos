@@ -1,0 +1,30 @@
+{
+  "shortcuts": { "bindings": { "openFolder": null } },
+  "actions": {
+    "ccmac.openFolder": {
+      "type": "workspace",
+      "title": "打开 Claude 项目",
+      "shortcut": "cmd+o",
+      "restart": "new",
+      "workspace": { "layout": { "pane": { "surfaces": [
+        { "type": "terminal", "command": "source __FOLDER_SCRIPT__", "focus": true }
+      ] } } }
+    },
+    "ccmac.newWorkspace": {
+      "type": "workspace",
+      "title": "新建 Claude 工作区",
+      "restart": "new",
+      "workspace": { "layout": { "pane": { "surfaces": [
+        { "type": "terminal", "command": "claude", "focus": true }
+      ] } } }
+    },
+    "cmux.newTerminal": {
+      "type": "command",
+      "title": "新建 Claude 会话",
+      "command": "claude",
+      "target": "newTabInCurrentPane",
+      "shortcut": "cmd+t"
+    }
+  },
+  "ui": { "newWorkspace": { "action": "ccmac.newWorkspace" } }
+}

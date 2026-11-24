@@ -1,0 +1,16 @@
+{
+  "name": "claude-code-on-mac",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "在 macOS 上配置和检查 Claude Code 工作环境",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "preview": "node scripts/setup.mjs preview",
+    "setup": "node scripts/setup.mjs install",
+    "undo": "node scripts/setup.mjs uninstall",
+    "test": "node --test"
+  },
+  "dependencies": { "jsonc-parser": "3.3.1" }
+}
