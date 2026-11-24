@@ -4,6 +4,7 @@
 <p align="center"><sub>macOS · cmux · Claude Code · MIT</sub></p>
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
+  <a href="docs/field-notes.md">我的踩坑记录</a> ·
   <a href="#日常快捷键">日常快捷键</a> ·
   <a href="docs/network.md">网络检查</a> ·
   <a href="docs/accounts.md">账号与续聊</a> ·
@@ -11,6 +12,10 @@
 </p>
 
 ![cmux 工作区示意：左侧选中 notes-app，右侧有「编写功能」和「审查改动」两个对话标签。](docs/assets/cmux-workspace.svg)
+
+## 我为什么做这套配置
+
+我遇到过 Apple 已扣款，Claude 却还显示免费，也遇到过终端底栏显示的是另一个账号的额度。后来做 cmux 本地接力，特意留了 5% 的余量，因为我最怕的是代码改到一半，下一句话还得重新交代背景。这里把遇到的问题、最后怎么查，以及哪些猜测至今没法证实，都记了下来。[读我的踩坑记录](docs/field-notes.md)
 
 ## 快速开始
 
