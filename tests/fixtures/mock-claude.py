@@ -35,6 +35,10 @@ if args[-1:] == ["/usage"]:
     if scenario == "malformed":
         reply({"result": "unknown format"})
     used = 95 if account == "alpha" and (root / "running").exists() else 10
+    if scenario in {"recover-current", "recover-next"} and (root / "running").exists():
+        recovered = (root / "blocked").exists()
+        wanted = "alpha" if scenario == "recover-current" else "bravo"
+        used = 10 if recovered and account == wanted else 95
     if scenario == "all-low":
         used = 99
     if scenario == "above":
@@ -78,6 +82,19 @@ hook("UserPromptSubmit")
 if scenario == "failure":
     hook("StopFailure", error="account_on_hold")
 hook("Stop", background_tasks=["running"] if scenario == "busy" else [], session_crons=[])
+if scenario in {"recover-current", "recover-next"}:
+    events = Path(shlex.split(settings["hooks"]["Stop"][0]["hooks"][0]["command"])[-2])
+    until = time.monotonic() + 70
+    while not (events / "quota-wait.json").exists() and time.monotonic() < until:
+        time.sleep(0.05)
+    assert hook("UserPromptSubmit") == 2
+    (root / "blocked").touch()
+    while (events / "quota-wait.json").exists() and time.monotonic() < until:
+        time.sleep(0.05)
+    if scenario == "recover-current":
+        assert hook("UserPromptSubmit") == 0
+        (root / "recovered").touch()
+        sys.exit()
 if scenario in {"busy", "failure", "above", "draft", "during-check"}:
     time.sleep(1.6)
     if scenario == "failure":

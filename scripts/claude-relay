@@ -230,6 +230,9 @@ def hook(events, action):
         if (events / "failed.json").exists():
             print("Claude 接力已暂停。请用 /exit 退出，核实后再恢复。", file=sys.stderr)
             return 2
+        if (events / "quota-wait.json").exists():
+            print("接力正在等待额度恢复，每分钟自动复查。此消息尚未发送。", file=sys.stderr)
+            return 2
         write_json(events / "submit.json", mark)
     elif action == "stop":
         mark["quiet"] = payload.get("background_tasks") == [] and payload.get("session_crons") == []
@@ -353,7 +356,7 @@ def eligible(roster, current, reserve):
     for account in accounts[start:] + accounts[:start]:
         if min(quota(account, roster).values()) > reserve:
             return account
-    raise RelayStopped(f"全部已登记账号均有额度窗口剩余不超过 {reserve}%。")
+    return None
 
 
 def register_cmux_resume(cwd, session_id, reserve):
@@ -472,7 +475,8 @@ def forward_terminal(roster, active, state, state_file, reserve, events, pid, ma
         # Keep forwarding the terminal while the official CLI reads quota.
         # Even a completed lookup is usable only at the same safe turn boundary.
         target = None
-        if lookup is not None and lookup.done():
+        check_finished = lookup is not None and lookup.done()
+        if check_finished:
             try:
                 target = lookup.result()
             except (RelayStopped, subprocess.TimeoutExpired) as error:
@@ -485,7 +489,7 @@ def forward_terminal(roster, active, state, state_file, reserve, events, pid, ma
             continue
         if lookup is not None:
             continue
-        if target is None and checked_stop == stop_at and time.monotonic() < next_check:
+        if not check_finished and checked_stop == stop_at and time.monotonic() < next_check:
             continue
         submitted = read_json(events / "submit.json").get("time", 0)
         if submitted > stop_at or not stop.get("quiet"):
@@ -497,7 +501,16 @@ def forward_terminal(roster, active, state, state_file, reserve, events, pid, ma
             if not record_session(events, stop, active, state, state_file):
                 continue
             recorded_stop = stop_at
-        if inputs.partial or inputs.last_edit > submitted:
+        quota_wait = events / "quota-wait.json"
+        if check_finished and lookup_stop == stop_at:
+            if target is None and not quota_wait.exists():
+                write_json(quota_wait, {"reserve": reserve})
+                relay_message(f"每个账号至少一项额度剩余 ≤ {reserve}%，每分钟自动复查。")
+            elif target == active and quota_wait.exists():
+                quota_wait.unlink()
+                relay_message("当前账号额度已恢复，可以继续原对话。")
+        # While waiting, poll even with a draft, but never move a draft to a different session.
+        if (inputs.partial or inputs.last_edit > submitted) and (target is not None or not quota_wait.exists()):
             continue
         if target is not None and lookup_stop == stop_at and target != active:
             if select.select([terminal], [], [], 0)[0]:
@@ -579,6 +592,8 @@ def main():
         if options.permission_mode:
             state["permission"] = options.permission_mode
         active = eligible(roster, state["account"], options.reserve)
+        if active is None:
+            raise RelayStopped(f"全部已登记账号均有额度窗口剩余不超过 {options.reserve}%。")
         if not options.resume:
             write_json(state_file, state)
             register_cmux_resume(cwd, session_id, options.reserve)

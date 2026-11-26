@@ -57,7 +57,7 @@ class RelayTests(unittest.TestCase):
             os.close(slave)
             output = bytearray()
             sent_draft = False
-            deadline = time.monotonic() + (75 if scenario == "idle-recheck" else 15)
+            deadline = time.monotonic() + (75 if scenario in {"idle-recheck", "recover-current", "recover-next"} else 15)
             try:
                 while time.monotonic() < deadline:
                     ready = list(self.home.glob("claude-relay-*/stop.json"))
@@ -110,6 +110,14 @@ class RelayTests(unittest.TestCase):
 
     def test_other_pane_consumes_quota_while_idle(self):
         self.assertTrue(self.terminal("idle-recheck").exists())
+
+    def test_quota_recovery_unblocks_current_session(self):
+        self.assertFalse(self.terminal("recover-current").exists())
+        self.assertTrue((self.home / "recovered").exists())
+
+    def test_quota_recovery_on_another_account_resumes_transcript(self):
+        self.assertTrue(self.terminal("recover-next").exists())
+        self.assertTrue((self.home / "blocked").exists())
 
     def test_weekly_boundary(self):
         self.assertTrue(self.terminal("weekly").exists())
